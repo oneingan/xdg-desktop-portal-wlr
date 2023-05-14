@@ -127,23 +127,22 @@ bool setup_target(struct xdpw_screencast_context *ctx, struct xdpw_session *sess
 		target_initialized = xdpw_wlr_target_from_data(ctx, target, data);
 	}
 	if (!target_initialized) {
-		target_initialized = xdpw_wlr_target_chooser(ctx, target);
-		//TODO: Chooser option to confirm the persist mode
-		const char *env_persist_str = getenv("XDPW_PERSIST_MODE");
-		if (env_persist_str) {
-			if (strcmp(env_persist_str, "transient") == 0) {
-				sess->screencast_data.persist_mode = sess->screencast_data.persist_mode > PERSIST_TRANSIENT
-					? PERSIST_TRANSIENT : sess->screencast_data.persist_mode;
-			} else if (strcmp(env_persist_str, "permanent") == 0) {
-				sess->screencast_data.persist_mode = sess->screencast_data.persist_mode > PERSIST_PERMANENT
-					? PERSIST_PERMANENT : sess->screencast_data.persist_mode;
-			} else {
-				sess->screencast_data.persist_mode = PERSIST_NONE;
-			}
-
-		} else {
-			sess->screencast_data.persist_mode = PERSIST_NONE;
-		}
+		struct xdpw_output_chooser chooser = {
+			.cmd = ctx->state->config->screencast_conf.chooser_cmd,
+			.type = ctx->state->config->screencast_conf.chooser_type,
+		};
+		struct xdpw_chooser_opts chooser_opts = {
+			.output_list = &ctx->output_list,
+			.target_mask = (1<<MONITOR),
+			.persist_mode = sess->screencast_data.persist_mode,
+			.outputname = ctx->state->config->screencast_conf.output_name,
+		};
+		struct xdpw_chooser_result chooser_result = {
+			.target = target,
+			.persist_mode = PERSIST_NONE,
+		};
+		if ((target_initialized = xdpw_wlr_target_chooser(&chooser, &chooser_opts, &chooser_result)))
+			sess->screencast_data.persist_mode = chooser_result.persist_mode;
 	}
 	if (!target_initialized) {
 		logprint(ERROR, "wlroots: no output found");
@@ -590,7 +589,7 @@ static int method_screencast_start(sd_bus_message *msg, void *data,
 		cast->node_id, 3,
 		"position", "(ii)", 0, 0,
 		"size", "(ii)", cast->screencopy_frame_info[WL_SHM].width, cast->screencopy_frame_info[WL_SHM].height,
-		"source_type", "u", 1 << MONITOR);
+		"source_type", "u", 1 << source_type_from_xdpw_source_type(cast->target->type));
 	if (ret < 0) {
 		return ret;
 	}

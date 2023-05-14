@@ -424,3 +424,15 @@ struct xdpw_frame_damage merge_damage(struct xdpw_frame_damage *damage1, struct 
 
 	return damage;
 }
+
+enum source_types source_type_from_xdpw_source_type(enum xdpw_source_types type) {
+	switch (type) {
+	case SOURCE_MONITOR:
+		return MONITOR;
+	case SOURCE_WINDOW:
+		return WINDOW;
+	default:
+		logprint(ERROR, "xdg-desktop-portal-wlr: unsupported source_type %d", type);
+		abort();
+	}
+}

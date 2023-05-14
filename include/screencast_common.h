@@ -36,6 +36,12 @@ enum buffer_type {
   DMABUF = 1,
 };
 
+enum xdpw_source_types {
+	SOURCE_NONE = 0,
+	SOURCE_MONITOR = 1,
+	SOURCE_WINDOW = 2,
+};
+
 enum xdpw_chooser_types {
   XDPW_CHOOSER_DEFAULT,
   XDPW_CHOOSER_NONE,
@@ -54,6 +60,22 @@ enum xdpw_frame_state {
 struct xdpw_output_chooser {
 	enum xdpw_chooser_types type;
 	char *cmd;
+};
+
+struct xdpw_chooser_opts {
+	struct wl_list *output_list;
+
+	// XDPW_CHOOSER_JSON
+	uint32_t target_mask;
+	enum persist_modes persist_mode;
+
+	// XDPW_CHOOSER_NONE
+	char *outputname;
+};
+
+struct xdpw_chooser_result {
+	struct xdpw_screencast_target *target;
+	enum persist_modes persist_mode;
 };
 
 struct xdpw_frame_damage {
@@ -138,6 +160,7 @@ struct xdpw_screencast_context {
 };
 
 struct xdpw_screencast_target {
+	enum xdpw_source_types type;
 	struct xdpw_wlr_output *output;
 	bool with_cursor;
 };
@@ -219,4 +242,6 @@ enum xdpw_chooser_types get_chooser_type(const char *chooser_type);
 const char *chooser_type_str(enum xdpw_chooser_types chooser_type);
 
 struct xdpw_frame_damage merge_damage(struct xdpw_frame_damage *damage1, struct xdpw_frame_damage *damage2);
+
+enum source_types source_type_from_xdpw_source_type(enum xdpw_source_types type);
 #endif /* SCREENCAST_COMMON_H */
