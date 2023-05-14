@@ -3,6 +3,7 @@
 #include "linux-dmabuf-unstable-v1-client-protocol.h"
 #include "wlr-screencopy-unstable-v1-client-protocol.h"
 #include <fcntl.h>
+#include <json-c/json.h>
 #include <limits.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -377,6 +378,7 @@ static bool wait_chooser(pid_t pid) {
 static bool wlr_output_chooser(struct xdpw_output_chooser *chooser,
 		struct wl_list *output_list, struct xdpw_wlr_output **output) {
 	logprint(DEBUG, "wlroots: output chooser called");
+	assert(chooser->type != XDPW_CHOOSER_JSON);
 	struct xdpw_wlr_output *out;
 	size_t chooser_msg_size = 0;
 	char *chooser_msg = NULL;
@@ -471,6 +473,187 @@ error_chooser_in:
 	return false;
 }
 
+static bool wlr_target_chooser(struct xdpw_output_chooser *chooser, struct xdpw_chooser_opts *opts,
+		struct xdpw_chooser_result *result) {
+	logprint(DEBUG, "wlroots: target chooser called");
+	assert(chooser->type == XDPW_CHOOSER_JSON);
+	result->target->output = NULL;
+	bool res = false;
+
+	size_t chooser_msg_size = 0;
+	char *chooser_msg = NULL;
+
+	int chooser_in[2]; //p -> c
+	int chooser_out[2]; //c -> p
+
+	if (pipe(chooser_in) == -1) {
+		perror("pipe chooser_in");
+		logprint(ERROR, "Failed to open pipe chooser_in");
+		goto error_chooser_in;
+	}
+	if (pipe(chooser_out) == -1) {
+		perror("pipe chooser_out");
+		logprint(ERROR, "Failed to open pipe chooser_out");
+		goto error_chooser_out;
+	}
+
+	pid_t pid = spawn_chooser(chooser->cmd, chooser_in, chooser_out);
+	if (pid < 0) {
+		logprint(ERROR, "Failed to fork chooser");
+		goto error_fork;
+	}
+
+	FILE *f = fdopen(chooser_in[1], "w");
+	if (f == NULL) {
+		perror("fdopen pipe chooser_in");
+		logprint(ERROR, "Failed to create stream writing to pipe chooser_in");
+		goto error_fork;
+	}
+
+	struct json_object *obj = json_object_new_object();
+	json_object_object_add(obj, "version", json_object_new_int(1));
+	json_object_object_add(obj, "revision", json_object_new_int(0));
+	struct json_object *target_obj = json_object_new_object();
+	if (opts->target_mask & (1<<SOURCE_MONITOR) && opts->output_list) {
+		struct json_object *monitors_obj = json_object_new_object();
+		struct json_object *monitor_arr = json_object_new_array();
+		struct xdpw_wlr_output *out;
+		wl_list_for_each(out, opts->output_list, link) {
+			struct json_object *monitor_obj = json_object_new_object();
+			json_object_object_add(monitor_obj, "name", json_object_new_string(out->name));
+			json_object_object_add(monitor_obj, "make", json_object_new_string(out->make));
+			json_object_object_add(monitor_obj, "model", json_object_new_string(out->model));
+			json_object_object_add(monitor_obj, "id", json_object_new_int(out->id));
+			json_object_array_add(monitor_arr, monitor_obj);
+		}
+		json_object_object_add(monitors_obj, "options", monitor_arr);
+		json_object_object_add(target_obj, "monitor", monitors_obj);
+		json_object_object_add(obj, "targets", target_obj);
+	}
+	struct json_object *options_obj = json_object_new_object();
+	struct json_object *persist_arr = json_object_new_array();
+	if (0 <= opts->persist_mode) {
+		struct json_object *persist_obj = json_object_new_object();
+		json_object_object_add(persist_obj, "none", json_object_new_int(0));
+		json_object_array_add(persist_arr, persist_obj);
+	}
+	if (1 <= opts->persist_mode) {
+		struct json_object *persist_obj = json_object_new_object();
+		json_object_object_add(persist_obj, "transient", json_object_new_int(1));
+		json_object_array_add(persist_arr, persist_obj);
+	}
+	if (2 <= opts->persist_mode) {
+		struct json_object *persist_obj = json_object_new_object();
+		json_object_object_add(persist_obj, "persistent", json_object_new_int(2));
+		json_object_array_add(persist_arr, persist_obj);
+	}
+	json_object_object_add(options_obj, "persist_mode", persist_arr);
+	json_object_object_add(obj, "options", options_obj);
+	size_t json_msg_size;
+	const char *json_msg = json_object_to_json_string_length(obj, JSON_C_TO_STRING_PLAIN, &json_msg_size);
+	if (json_msg_size == 0 || !json_msg) {
+		fclose(f);
+		logprint(ERROR, "Failed to create json_msg");
+		goto error_chooser_out;
+	}
+	logprint(TRACE, "chooser: jsonmsg %s", json_msg);
+	fwrite(json_msg, 1, json_msg_size, f);
+	logprint(TRACE, "chooser: json_msg %s", json_msg);
+	fclose(f);
+	json_object_put(obj);
+
+	if (!wait_chooser(pid)) {
+		close(chooser_out[0]);
+		return false;
+	}
+
+	f = fdopen(chooser_out[0], "r");
+	if (f == NULL) {
+		perror("fdopen pipe chooser_out");
+		logprint(ERROR, "Failed to create stream reading from pipe chooser_out");
+		close(chooser_out[0]);
+		goto end;
+	}
+
+	ssize_t nread = getline(&chooser_msg, &chooser_msg_size, f);
+	fclose(f);
+	if (nread < 0) {
+		perror("getline failed");
+		goto end;
+	}
+
+	obj = json_tokener_parse(chooser_msg);
+	struct json_object *value;
+	json_object_object_get_ex(obj, "version", &value);
+	if (json_object_get_int(value) != 1) {
+		logprint(ERROR, "Chooser returned msg with wrong version %d", json_object_get_int(value));
+		goto error_chooser_msg;
+	}
+	json_object_object_get_ex(obj, "revision", &value);
+	if (json_object_get_int(value) > 0) {
+		logprint(ERROR, "Chooser returned msg with wrong revision %d", json_object_get_int(value));
+		goto error_chooser_msg;
+	}
+	json_object_object_get_ex(obj, "persist_mode", &value);
+	result->persist_mode = json_object_get_int(obj);
+	if (result->persist_mode < 0 || result->persist_mode > opts->persist_mode) {
+		logprint(WARN, "Chooser returned msg with invalid persist_mode: %d (%d). Ignoring it.", result->persist_mode, opts->persist_mode);
+		result->persist_mode = PERSIST_NONE;
+	}
+	json_object_object_get_ex(obj, "target_type", &value);
+	const char *target_type = json_object_get_string(value);
+	if (opts->target_mask & (1<<SOURCE_MONITOR) && strcmp(target_type, "monitor") == 0) {
+		result->target->type = SOURCE_MONITOR;
+		struct json_object *target_obj;
+		json_object_object_get_ex(obj, "target", &target_obj);
+		struct xdpw_wlr_output *out;
+		wl_list_for_each(out, opts->output_list, link) {
+			json_object_object_get_ex(target_obj, "name", &value);
+			if (strcmp(out->name, json_object_get_string(value)) != 0) {
+				logprint(TRACE, "chooser: wrong name %s:%s", out->name, json_object_get_string(value));
+				continue;
+			}
+			json_object_object_get_ex(target_obj, "model", &value);
+			if (strcmp(out->model, json_object_get_string(value)) != 0) {
+				logprint(TRACE, "chooser: wrong model %s:%s", out->model, json_object_get_string(value));
+				continue;
+			}
+			json_object_object_get_ex(target_obj, "make", &value);
+			if (strcmp(out->make, json_object_get_string(value)) != 0) {
+				logprint(TRACE, "chooser: wrong make %s:%s", out->make, json_object_get_string(value));
+				continue;
+			}
+			json_object_object_get_ex(target_obj, "id", &value);
+			if (out->id != (unsigned int)json_object_get_int(value)) {
+				logprint(TRACE, "chooser: wrong name %u:%d", out->id, json_object_get_int(value));
+				continue;
+			}
+			result->target->output = out;
+			res = true;
+			break;
+		}
+		if (!result->target->output)
+			logprint(ERROR, "chooser: unable to find returned output");
+	} else {
+		logprint(ERROR, "Chooser returned msg with wrong target_type %s", target_type);
+		goto error_chooser_msg;
+	}
+error_chooser_msg:
+	free(chooser_msg);
+
+end:
+	return res;
+
+error_fork:
+	close(chooser_out[0]);
+	close(chooser_out[1]);
+error_chooser_out:
+	close(chooser_in[0]);
+	close(chooser_in[1]);
+error_chooser_in:
+	return false;
+}
+
 static struct xdpw_wlr_output *wlr_output_chooser_default(struct wl_list *output_list) {
 	logprint(DEBUG, "wlroots: output chooser called");
 	struct xdpw_output_chooser default_chooser[] = {
@@ -536,24 +719,27 @@ end:
 }
 
 bool xdpw_wlr_target_chooser(struct xdpw_output_chooser *chooser, struct xdpw_chooser_opts *opts, struct xdpw_chooser_result *result) {
-	result->target->type = SOURCE_MONITOR;
-	result->target->output = xdpw_wlr_output_chooser(chooser, opts);
-	const char *env_persist_str = getenv("XDPW_PERSIST_MODE");
-	if (env_persist_str) {
-		if (strcmp(env_persist_str, "transient") == 0) {
-			result->persist_mode = PERSIST_TRANSIENT <= opts->persist_mode
-							? PERSIST_TRANSIENT : opts->persist_mode;
-		} else if (strcmp(env_persist_str, "permanent") == 0) {
-			result->persist_mode = PERSIST_PERMANENT <= opts->persist_mode
-							? PERSIST_PERMANENT : opts->persist_mode;
+	if (chooser->type != XDPW_CHOOSER_JSON) {
+		result->target->type = SOURCE_MONITOR;
+		result->target->output = xdpw_wlr_output_chooser(chooser, opts);
+		const char *env_persist_str = getenv("XDPW_PERSIST_MODE");
+		if (env_persist_str) {
+			if (strcmp(env_persist_str, "transient") == 0) {
+				result->persist_mode = PERSIST_TRANSIENT <= opts->persist_mode
+								? PERSIST_TRANSIENT : opts->persist_mode;
+			} else if (strcmp(env_persist_str, "permanent") == 0) {
+				result->persist_mode = PERSIST_PERMANENT <= opts->persist_mode
+								? PERSIST_PERMANENT : opts->persist_mode;
+			} else {
+				result->persist_mode = PERSIST_NONE;
+			}
+
 		} else {
 			result->persist_mode = PERSIST_NONE;
 		}
-
-	} else {
-		result->persist_mode = PERSIST_NONE;
+		return result->target->output != NULL;
 	}
-	return result->target->output != NULL;
+	return wlr_target_chooser(chooser, opts, result);
 }
 
 bool xdpw_wlr_target_from_data(struct xdpw_screencast_context *ctx, struct xdpw_screencast_target *target,
