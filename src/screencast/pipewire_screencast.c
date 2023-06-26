@@ -330,7 +330,7 @@ fixate_format:
 			sizeof(struct spa_meta_region) * 1,
 			sizeof(struct spa_meta_region) * 4));
 
-	params[3] = spa_pod_builder_add_object(&b[2].b,
+	params[4] = spa_pod_builder_add_object(&b[2].b,
 		SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta,
 		SPA_PARAM_META_type, SPA_POD_Id(SPA_META_VideoCrop),
 		SPA_PARAM_META_size, SPA_POD_Int(sizeof(struct spa_meta_region)));
